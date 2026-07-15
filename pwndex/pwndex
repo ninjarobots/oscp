@@ -1,0 +1,1175 @@
+#!/usr/bin/env python3
+"""
+vulnsearch - CVE and PoC hunter with TUI
+Searches searchsploit + GitHub, browse results, view READMEs, clone repos.
+
+Usage:
+    vulnsearch <service> [version] [options]
+"""
+
+import argparse
+import curses
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+import urllib.parse
+import urllib.request
+from difflib import SequenceMatcher
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+CACHE_DIR = os.path.expanduser("~/.cache/vulnsearch")
+CACHE_TTL  = 60 * 60 * 24  # 24 hours default
+
+
+def _cache_key(service: str, version: str, type_key: str | None,
+               no_github: bool, no_searchsploit: bool) -> str:
+    raw = f"{service}|{version}|{type_key}|{no_github}|{no_searchsploit}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _cache_path(key: str) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, f"{key}.json")
+
+
+def cache_load(key: str, ttl: int) -> list[dict] | None:
+    path = _cache_path(key)
+    if not os.path.exists(path):
+        return None
+    age = time.time() - os.path.getmtime(path)
+    if age > ttl:
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def cache_save(key: str, data: list[dict]) -> None:
+    try:
+        with open(_cache_path(key), "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def results_to_dicts(results: list) -> list[dict]:
+    return [
+        {k: v for k, v in r.__dict__.items()
+         if not k.startswith("_")}
+        for r in results
+    ]
+
+
+def dicts_to_results(data: list[dict]) -> list:
+    out = []
+    for d in data:
+        r = Result(
+            kind=d.get("kind", "github"),
+            title=d.get("title", ""),
+            url=d.get("url", ""),
+            edb_id=d.get("edb_id", ""),
+            ss_type=d.get("ss_type", ""),
+            path=d.get("path", ""),
+            platform=d.get("platform", ""),
+            stars=d.get("stars", 0),
+            language=d.get("lang", ""),
+            description=d.get("desc", ""),
+            updated=d.get("updated", ""),
+        )
+        out.append(r)
+    return out
+
+
+def cache_clear(service: str = None) -> int:
+    """Clear all cache entries, or just those matching a service prefix. Returns count."""
+    if not os.path.exists(CACHE_DIR):
+        return 0
+    removed = 0
+    for fname in os.listdir(CACHE_DIR):
+        if fname.endswith(".json"):
+            fpath = os.path.join(CACHE_DIR, fname)
+            # If service given, check the metadata file; otherwise nuke all
+            if service:
+                try:
+                    with open(fpath) as f:
+                        data = json.load(f)
+                    # cache entries are lists of result dicts; check titles
+                    if not any(service.lower() in (d.get("title","") +
+                               d.get("desc","")).lower() for d in data):
+                        continue
+                except Exception:
+                    pass
+            os.remove(fpath)
+            removed += 1
+    return removed
+
+
+# ── Exploit type definitions ──────────────────────────────────────────────────
+EXPLOIT_TYPES = {
+    "rce":  {"label": "Remote Code Execution",
+             "keywords": {"rce", "remote code execution", "remote command", "code exec",
+                          "command injection", "webshell", "shell upload", "reverse shell"},
+             "ss_types": {"webapps", "remote"}},
+    "lpe":  {"label": "Local Privilege Escalation",
+             "keywords": {"privilege escalation", "privesc", "lpe", "local privilege",
+                          "local root", "elevation of privilege", "eop", "suid",
+                          "sudo exploit", "kernel exploit"},
+             "ss_types": {"local"}},
+    "sqli": {"label": "SQL Injection",
+             "keywords": {"sql injection", "sqli", "blind sql", "union select"},
+             "ss_types": {"webapps"}},
+    "lfi":  {"label": "Local File Inclusion",
+             "keywords": {"local file inclusion", "lfi", "path traversal",
+                          "directory traversal", "arbitrary file"},
+             "ss_types": {"webapps"}},
+    "ssrf": {"label": "Server-Side Request Forgery",
+             "keywords": {"ssrf", "server-side request forgery"},
+             "ss_types": {"webapps"}},
+    "auth": {"label": "Authentication Bypass",
+             "keywords": {"auth bypass", "authentication bypass", "bypass login",
+                          "unauthenticated", "no auth"},
+             "ss_types": {"webapps", "remote"}},
+    "dos":  {"label": "Denial of Service",
+             "keywords": {"denial of service", "dos", "crash", "buffer overflow", "bof"},
+             "ss_types": {"dos"}},
+    "xxe":  {"label": "XXE Injection",
+             "keywords": {"xxe", "xml external entity"},
+             "ss_types": {"webapps"}},
+}
+
+# ── Colour pairs (curses) ─────────────────────────────────────────────────────
+CP_NORMAL    = 1
+CP_SELECTED  = 2
+CP_HEADER    = 3
+CP_SUCCESS   = 4
+CP_WARNING   = 5
+CP_DIM       = 6
+CP_TITLE     = 7
+CP_SEPARATOR = 8
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(CP_NORMAL,    curses.COLOR_WHITE,   -1)
+    curses.init_pair(CP_SELECTED,  curses.COLOR_BLACK,   curses.COLOR_CYAN)
+    curses.init_pair(CP_HEADER,    curses.COLOR_CYAN,    -1)
+    curses.init_pair(CP_SUCCESS,   curses.COLOR_GREEN,   -1)
+    curses.init_pair(CP_WARNING,   curses.COLOR_YELLOW,  -1)
+    curses.init_pair(CP_DIM,       curses.COLOR_WHITE,   -1)
+    curses.init_pair(CP_TITLE,     curses.COLOR_CYAN,    -1)
+    curses.init_pair(CP_SEPARATOR, curses.COLOR_BLUE,    -1)
+
+
+# ── Result dataclass ──────────────────────────────────────────────────────────
+class Result:
+    def __init__(self, kind: str, title: str, url: str, **kw):
+        self.kind    = kind   # "github" | "searchsploit"
+        self.title   = title
+        self.url     = url
+        self.edb_id  = kw.get("edb_id", "")
+        self.ss_type = kw.get("ss_type", "")
+        self.path    = kw.get("path", "")     # local path to exploit file
+        self.platform= kw.get("platform", "")
+        self.stars   = kw.get("stars", 0)
+        self.lang    = kw.get("language", "")
+        self.desc    = kw.get("description", "")
+        self.updated = kw.get("updated", "")
+        self.cloned  = False
+        self.clone_path = ""
+
+    @property
+    def label(self) -> str:
+        if self.kind == "github":
+            stars = f" ★{self.stars}" if self.stars else ""
+            lang  = f" [{self.lang}]" if self.lang else ""
+            return f"[GH]{stars}{lang}  {self.title}"
+        else:
+            t = f" [{self.ss_type}]" if self.ss_type else ""
+            return f"[EDB]{t}  {self.title}"
+
+    @property
+    def clone_url(self) -> str:
+        if self.kind == "github":
+            return f"{self.url}.git"
+        return ""
+
+
+# ── Search functions ──────────────────────────────────────────────────────────
+def version_score(a, b):
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def version_matches(text, version, threshold=0.6):
+    if not version: return True
+    tl = text.lower(); vl = version.lower()
+    if vl in tl: return True
+    tokens = re.findall(r'[\d]+(?:[._-][\w]+)*', text)
+    return any(version_score(t, vl) >= threshold for t in tokens)
+
+def text_matches_type(text, type_def):
+    if not type_def: return True
+    tl = text.lower()
+    return any(kw in tl for kw in type_def["keywords"])
+
+def _cmd_exists(name):
+    return subprocess.run(["which", name], capture_output=True).returncode == 0
+
+def _gh_request(url):
+    token = os.environ.get("GITHUB_TOKEN", "")
+    headers = {"Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+def fetch_searchsploit(service, version, fuzzy, type_def, out: list, status: list):
+    status[0] = "Querying searchsploit..."
+    if not _cmd_exists("searchsploit"):
+        status[0] = "searchsploit not found"
+        return
+    q   = f"{service} {version}".strip()
+    cmd = ["searchsploit", "--json"] + (["-t"] if fuzzy else []) + [q]
+    try:
+        r    = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        data = json.loads(r.stdout)
+    except Exception as e:
+        status[0] = f"searchsploit error: {e}"
+        return
+    for e in data.get("RESULTS_EXPLOIT", []):
+        title = e.get("Title", "")
+        if version and not version_matches(title, version): continue
+        if type_def:
+            ss_t = e.get("Type", "").lower()
+            kw_hit = text_matches_type(title, type_def)
+            ty_hit = ss_t in {t.lower() for t in type_def["ss_types"]}
+            if not (kw_hit or ty_hit): continue
+        out.append(Result(
+            kind="searchsploit", title=title,
+            url=f"https://www.exploit-db.com/exploits/{e.get('EDB-ID','')}",
+            edb_id=e.get("EDB-ID",""), ss_type=e.get("Type",""),
+            path=e.get("Path",""), platform=e.get("Platform",""),
+            description=title,
+        ))
+    status[0] = f"searchsploit done ({len([x for x in out if x.kind=='searchsploit'])} results)"
+
+def fetch_github(service, version, type_key, type_def, out: list, status: list):
+    status[0] = "Searching GitHub..."
+    type_term = type_key if type_key else "exploit poc"
+    queries   = [f"{service} {type_term}", f"{service} CVE"]
+    if version:
+        queries = [f"{service} {version} {type_term}", f"{service} {version} CVE"] + queries
+
+    base_kw = {"exploit","poc","cve","rce","lfi","sqli","privesc","bypass",
+                "injection","vuln","lpe","ssrf","overflow","shell","dos","xxe"}
+    seen = set()
+
+    for q in queries:
+        enc  = urllib.parse.quote(q)
+        url  = (f"https://api.github.com/search/repositories"
+                f"?q={enc}&sort=updated&order=desc&per_page=10")
+        data = _gh_request(url)
+        if not data: break
+
+        for repo in data.get("items", []):
+            name = repo.get("full_name","")
+            if name in seen: continue
+            seen.add(name)
+            title    = repo.get("name","")
+            desc     = repo.get("description") or ""
+            combined = f"{title} {desc}".lower()
+            if service.lower().split()[0] not in combined: continue
+            if type_def:
+                if not text_matches_type(combined, type_def): continue
+            else:
+                if not any(kw in combined for kw in base_kw): continue
+            if version and not version_matches(combined, version): continue
+            out.append(Result(
+                kind="github", title=name, url=repo.get("html_url",""),
+                stars=repo.get("stargazers_count",0),
+                language=repo.get("language") or "",
+                description=desc,
+                updated=repo.get("updated_at","")[:10],
+            ))
+        if len([x for x in out if x.kind=="github"]) >= 15:
+            break
+
+    gh = [x for x in out if x.kind=="github"]
+    gh.sort(key=lambda r: r.stars, reverse=True)
+    status[0] = f"GitHub done ({len(gh)} results)"
+
+
+# ── Fetch README / file content ───────────────────────────────────────────────
+def fetch_readme(result: Result) -> str:
+    if result.kind == "github":
+        # Try common README names via GitHub raw
+        parts = result.title.split("/")
+        if len(parts) == 2:
+            owner, repo = parts
+            for name in ("README.md", "readme.md", "README.txt", "README.rst", "README"):
+                raw = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{name}"
+                try:
+                    req = urllib.request.Request(raw)
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        return r.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                raw2 = raw.replace("/main/", "/master/")
+                try:
+                    req = urllib.request.Request(raw2)
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        return r.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+        return "[Could not fetch README]"
+    else:
+        # searchsploit local file
+        if result.path and os.path.exists(result.path):
+            try:
+                with open(result.path, "r", errors="replace") as f:
+                    return f.read()
+            except Exception as e:
+                return f"[Error reading file: {e}]"
+        return f"[File not found: {result.path}]"
+
+
+def clone_repo(result: Result, clone_dir="/tmp") -> tuple[bool, str]:
+    if result.kind != "github":
+        return False, "Not a GitHub result"
+    dest = os.path.join(clone_dir, result.title.split("/")[-1])
+    if os.path.exists(dest):
+        result.cloned = True
+        result.clone_path = dest
+        return True, f"Already exists: {dest}"
+    try:
+        r = subprocess.run(
+            ["git", "clone", "--depth", "1", result.clone_url, dest],
+            capture_output=True, text=True, timeout=60
+        )
+        if r.returncode == 0:
+            result.cloned = True
+            result.clone_path = dest
+            return True, f"Cloned to {dest}"
+        return False, r.stderr.strip()
+    except Exception as e:
+        return False, str(e)
+
+
+# ── ANSI → curses segment parser ─────────────────────────────────────────────
+_ANSI_RE = re.compile(r'\x1b\[([0-9;]*)m')
+_OSC_RE  = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')  # OSC sequences incl. hyperlinks
+
+# Map ANSI colour indices to curses colour constants
+_ANSI_COLOR_MAP = {
+    0: curses.COLOR_BLACK,  1: curses.COLOR_RED,    2: curses.COLOR_GREEN,
+    3: curses.COLOR_YELLOW, 4: curses.COLOR_BLUE,   5: curses.COLOR_MAGENTA,
+    6: curses.COLOR_CYAN,   7: curses.COLOR_WHITE,
+}
+
+# We allocate extra colour pairs on demand starting from 20
+_extra_pairs: dict[tuple, int] = {}
+_next_pair = [20]
+
+def _get_color_pair(fg: int) -> int:
+    key = (fg, -1)
+    if key not in _extra_pairs:
+        n = _next_pair[0]
+        _next_pair[0] += 1
+        try:
+            curses.init_pair(n, fg, -1)
+            _extra_pairs[key] = n
+        except (curses.error, ValueError):
+            return 0  # fall back to default pair
+    return _extra_pairs.get(key, 0)
+
+
+def parse_ansi_segments(text: str) -> list[tuple[str, int]]:
+    """
+    Parse ANSI-escaped text into list of (chunk, curses_attr) tuples.
+    Called after curses is initialised so colour pairs can be registered.
+    """
+    # Strip OSC sequences (hyperlinks, titles, etc) — curses can't render them
+    text = _OSC_RE.sub('', text)
+    segments = []
+    pos      = 0
+    bold = underline = italic = False
+    fg_pair  = 0  # 0 = default
+
+    def _attr():
+        a = fg_pair
+        if bold:      a |= curses.A_BOLD
+        if underline: a |= curses.A_UNDERLINE
+        if italic:    a |= curses.A_DIM   # curses has no italic; dim is close enough
+        return a
+
+    for m in _ANSI_RE.finditer(text):
+        if m.start() > pos:
+            chunk = text[pos:m.start()]
+            if chunk:
+                segments.append((chunk, _attr()))
+
+        codes = [int(c) if c else 0 for c in m.group(1).split(';')] if m.group(1) else [0]
+        for code in codes:
+            if code == 0:
+                bold = underline = italic = False
+                fg_pair = 0
+            elif code == 1:
+                bold = True
+            elif code == 3:
+                italic = True
+            elif code == 4:
+                underline = True
+            elif code == 22:
+                bold = False
+            elif code == 23:
+                italic = False
+            elif code == 24:
+                underline = False
+            elif 30 <= code <= 37:
+                fg_pair = curses.color_pair(_get_color_pair(_ANSI_COLOR_MAP[code - 30]))
+            elif 90 <= code <= 97:
+                # Bright colours — map to standard
+                fg_pair = curses.color_pair(_get_color_pair(
+                    _ANSI_COLOR_MAP.get(code - 90, curses.COLOR_WHITE)))
+            # Background codes and others ignored
+
+        pos = m.end()
+
+    if pos < len(text):
+        chunk = text[pos:]
+        if chunk:
+            segments.append((chunk, _attr()))
+
+    return segments
+
+
+def render_markdown(content: str, width: int) -> list[list[tuple[str, int]]]:
+    """
+    Render markdown via `rich` and return a list of lines.
+    Each line is a list of (chunk, curses_attr) segments.
+    Falls back to plain text if rich is unavailable.
+    """
+    try:
+        import io
+        from rich.console import Console
+        from rich.markdown import Markdown as RichMD
+
+        buf     = io.StringIO()
+        console = Console(file=buf, force_terminal=True,
+                          width=max(40, width - 2), highlight=False,
+                          markup=False)
+        console.print(RichMD(content))
+        rendered = buf.getvalue()
+    except ImportError:
+        rendered = content  # plain fallback
+
+    lines = []
+    # Strip OSC hyperlinks before splitting — they can span line boundaries
+    rendered = _OSC_RE.sub('', rendered)
+    for raw_line in rendered.splitlines():
+        # Strip trailing whitespace / background-fill padding rich adds
+        raw_line = raw_line.rstrip()
+        segments = parse_ansi_segments(raw_line)
+        lines.append(segments)
+    return lines
+
+
+# ── TUI ───────────────────────────────────────────────────────────────────────
+class TUI:
+    def __init__(self, stdscr, results: list[Result], label: str):
+        self.scr      = stdscr
+        self.results  = results
+        self.label    = label
+        self.idx      = 0        # selected result
+        self.scroll   = 0        # list scroll offset
+        self.detail_scroll = 0
+        self.mode     = "list"   # "list" | "detail"
+        # Each entry: list of (chunk, curses_attr) segments for one line
+        self.detail_lines: list[list[tuple[str, int]]] = []
+        self.status   = ""
+        self.loading  = False
+
+    # ── Layout helpers ────────────────────────────────────────────
+    def dims(self):
+        h, w = self.scr.getmaxyx()
+        list_w   = max(30, w // 3)
+        detail_w = w - list_w - 1
+        return h, w, list_w, detail_w
+
+    def safe_addstr(self, win, y, x, text, attr=0):
+        try:
+            h, w = win.getmaxyx()
+            if y < 0 or y >= h or x < 0 or x >= w: return
+            max_len = w - x - 1
+            if max_len <= 0: return
+            win.addstr(y, x, text[:max_len], attr)
+        except curses.error:
+            pass
+
+    # ── Draw ──────────────────────────────────────────────────────
+    def draw(self):
+        self.scr.erase()
+        h, w, list_w, detail_w = self.dims()
+
+        # Title bar
+        title = f" vulnsearch — {self.label} "
+        self.safe_addstr(self.scr, 0, 0, title.ljust(w),
+                         curses.color_pair(CP_HEADER) | curses.A_BOLD)
+
+        # Key hints at bottom
+        if self.mode == "list":
+            hints = " ↑↓ navigate  ENTER view  c clone  q quit "
+        else:
+            hints = " ↑↓ scroll  c clone  r readme  b back  q quit "
+        self.safe_addstr(self.scr, h - 1, 0, hints.ljust(w),
+                         curses.color_pair(CP_HEADER))
+
+        # Status bar
+        if self.status:
+            self.safe_addstr(self.scr, h - 2, 0, f" {self.status}".ljust(w),
+                             curses.color_pair(CP_WARNING))
+
+        list_h = h - 3  # rows available for list + detail
+
+        if self.mode == "list":
+            self._draw_list(1, 0, list_h, w)
+        else:
+            self._draw_list(1, 0, list_h, list_w)
+            # Vertical divider
+            for row in range(1, h - 2):
+                self.safe_addstr(self.scr, row, list_w, "│",
+                                 curses.color_pair(CP_SEPARATOR))
+            self._draw_detail(1, list_w + 1, list_h, detail_w)
+
+        self.scr.refresh()
+
+    def _card_lines(self, r: "Result", width: int) -> list[tuple[str, int]]:
+        """
+        Build the display lines for one result card.
+        Returns list of (text, style_str) tuples.
+        Each card is:
+          Line 0: [badge] title  [score]              (bold / selected)
+          Line 1: meta (stars/type/platform/lang/date) (dim)
+          Line 2: description wrapped to width-4        (normal)
+          Line 3: url                                   (success/green)
+          Line 4: separator
+        """
+        lines = []
+        w = width - 2
+
+        # Line 0 — title + score
+        badge  = "✓ [GH] " if r.kind == "github" and r.cloned else \
+                 "  [GH] " if r.kind == "github" else \
+                 "✓ [EDB]" if r.cloned else "  [EDB]"
+        score  = getattr(r, "_score", 0)
+        score_tag = f" [{score:.0f}]"
+        title_str = f"{badge} {r.title}"
+        # Right-align score tag
+        pad = max(0, w - len(title_str) - len(score_tag))
+        title_line = f"{title_str}{' ' * pad}{score_tag}"
+        lines.append((title_line[:w], "title"))
+
+        # Line 1 — meta
+        if r.kind == "github":
+            meta = f"  ★{r.stars}  {r.lang}  {r.updated}"
+        else:
+            meta = f"  EDB-{r.edb_id}  {r.ss_type}  {r.platform}"
+        lines.append((meta[:w], "dim"))
+
+        # Line 2 — description (wrap if needed, max 2 lines)
+        desc = r.desc or r.title
+        wrapped = textwrap.wrap(desc, w - 4)[:2]
+        for wl in wrapped:
+            lines.append((f"  {wl}", "normal"))
+        if not wrapped:
+            lines.append(("", "normal"))
+
+        # Line 3 — URL
+        lines.append((f"  {r.url}"[:w], "success"))
+
+        # Line 4 — separator
+        lines.append(("─" * (width - 1), "separator"))
+
+        return lines
+
+    def _build_flat_list(self, width: int):
+        """
+        Build a flat list of renderable rows for the list pane.
+        No section headers — results sorted by relevance across both sources.
+        """
+        flat = []
+        for result_idx, r in enumerate(self.results):
+            card = self._card_lines(r, width)
+            for line_data in card:
+                flat.append(("card", line_data, result_idx))
+        return flat
+
+    def _draw_list(self, top, left, height, width):
+        flat = self._build_flat_list(width)
+
+        # Find the row range for the selected result
+        selected_rows = [i for i, (t, _, ri) in enumerate(flat)
+                         if t == "card" and ri == self.idx]
+
+        if selected_rows:
+            first_sel = selected_rows[0]
+            last_sel  = selected_rows[-1]
+            # Scroll up if selection is above viewport
+            if first_sel < self.scroll:
+                self.scroll = first_sel
+            # Scroll down if selection is below viewport
+            elif last_sel >= self.scroll + height:
+                self.scroll = last_sel - height + 1
+
+        row = top
+        for i, (item_type, data, result_idx) in enumerate(flat):
+            if i < self.scroll:
+                continue
+            if row >= top + height:
+                break
+
+            # card line
+            text, style = data
+            is_selected = (result_idx == self.idx)
+
+            if is_selected:
+                attr = curses.color_pair(CP_SELECTED) | curses.A_BOLD
+            elif style == "title":
+                r = self.results[result_idx]
+                attr = curses.color_pair(CP_SUCCESS) | curses.A_BOLD if r.cloned \
+                       else curses.color_pair(CP_NORMAL) | curses.A_BOLD
+            elif style == "dim":
+                attr = curses.color_pair(CP_DIM) | curses.A_DIM
+            elif style == "success":
+                attr = curses.color_pair(CP_SUCCESS)
+            elif style == "separator":
+                attr = curses.color_pair(CP_SEPARATOR) | curses.A_DIM
+            else:
+                attr = curses.color_pair(CP_NORMAL)
+
+            # Pad selected lines to full width for highlight bar
+            if is_selected:
+                text = text.ljust(width - 1)
+
+            self.safe_addstr(self.scr, row, left, text[:width - 1], attr)
+            row += 1
+
+        if not self.results:
+            self.safe_addstr(self.scr, top + 2, left + 2, "No results found",
+                             curses.color_pair(CP_WARNING))
+
+    def _draw_detail(self, top, left, height, width):
+        if self.idx >= len(self.results):
+            return
+        r = self.results[self.idx]
+
+        # Header
+        self.safe_addstr(self.scr, top, left,
+                         f" {r.title}"[:width],
+                         curses.color_pair(CP_TITLE) | curses.A_BOLD)
+
+        # Meta
+        meta_row = top + 1
+        if r.kind == "github":
+            meta = f" Stars: {r.stars}  Lang: {r.lang}  Updated: {r.updated}"
+            self.safe_addstr(self.scr, meta_row, left, meta[:width],
+                             curses.color_pair(CP_DIM) | curses.A_DIM)
+            meta_row += 1
+            if r.desc:
+                for line in textwrap.wrap(r.desc, width - 2):
+                    self.safe_addstr(self.scr, meta_row, left, f" {line}", curses.color_pair(CP_NORMAL))
+                    meta_row += 1
+        else:
+            meta = f" EDB-ID: {r.edb_id}  Type: {r.ss_type}  Platform: {r.platform}"
+            self.safe_addstr(self.scr, meta_row, left, meta[:width],
+                             curses.color_pair(CP_DIM) | curses.A_DIM)
+            meta_row += 1
+
+        # URL
+        self.safe_addstr(self.scr, meta_row, left, f" {r.url}"[:width],
+                         curses.color_pair(CP_SUCCESS))
+        meta_row += 1
+
+        if r.cloned:
+            self.safe_addstr(self.scr, meta_row, left,
+                             f" ✓ Cloned: {r.clone_path}"[:width],
+                             curses.color_pair(CP_SUCCESS) | curses.A_BOLD)
+            meta_row += 1
+
+        # Divider
+        meta_row += 1
+        self.safe_addstr(self.scr, meta_row, left, "─" * (width - 1),
+                         curses.color_pair(CP_SEPARATOR))
+        meta_row += 1
+
+        # Content
+        content_height = height - (meta_row - top)
+        if not self.detail_lines:
+            hint = " Press r to load README / exploit file"
+            self.safe_addstr(self.scr, meta_row, left, hint,
+                             curses.color_pair(CP_WARNING))
+        else:
+            visible = self.detail_lines[self.detail_scroll:
+                                         self.detail_scroll + content_height]
+            for i, seg_line in enumerate(visible):
+                col = left + 1
+                draw_row = meta_row + i
+                for chunk, attr in seg_line:
+                    if col >= left + width - 1:
+                        break
+                    avail = left + width - 1 - col
+                    try:
+                        self.scr.addstr(draw_row, col, chunk[:avail], attr)
+                    except curses.error:
+                        pass
+                    col += len(chunk)
+
+            # Scroll indicator
+            total = len(self.detail_lines)
+            if total > content_height:
+                pct = int(self.detail_scroll / max(1, total - content_height) * 100)
+                self.safe_addstr(self.scr, meta_row + content_height - 1,
+                                 left + width - 8, f" {pct:3d}%  ",
+                                 curses.color_pair(CP_DIM) | curses.A_DIM)
+
+    # ── Actions ───────────────────────────────────────────────────
+    def load_detail(self):
+        if self.idx >= len(self.results):
+            return
+        r = self.results[self.idx]
+        self.status = "Loading..."
+        self.draw()
+
+        def _fetch():
+            content = fetch_readme(r)
+            _, _, list_w, detail_w = self.dims()
+            is_md = (r.kind == "github" or
+                     (r.path or "").endswith((".md", ".txt", ".py", ".rb", ".sh")))
+            if is_md:
+                self.detail_lines = render_markdown(content, detail_w)
+            else:
+                # Plain text — wrap long lines into plain segments
+                self.detail_lines = []
+                for line in content.splitlines():
+                    wrapped = textwrap.wrap(line, detail_w - 4) if len(line) > detail_w - 4 else [line]
+                    for wl in (wrapped or [""]):
+                        self.detail_lines.append([(wl, curses.color_pair(CP_NORMAL))])
+            self.detail_scroll = 0
+            self.status = f"Loaded ({len(self.detail_lines)} lines)"
+            self.draw()
+
+        t = threading.Thread(target=_fetch, daemon=True)
+        t.start()
+        t.join(timeout=15)
+        if t.is_alive():
+            self.status = "Timeout fetching content"
+
+    def do_clone(self):
+        if self.idx >= len(self.results):
+            return
+        r = self.results[self.idx]
+        if r.kind != "github":
+            self.status = "Can only clone GitHub repos"
+            return
+        self.status = f"Cloning {r.title}..."
+        self.draw()
+        ok, msg = clone_repo(r)
+        self.status = msg
+
+    # ── Main loop ─────────────────────────────────────────────────
+    def run(self):
+        init_colors()
+        curses.curs_set(0)
+        self.scr.keypad(True)
+
+        while True:
+            self.draw()
+            key = self.scr.getch()
+
+            if key in (ord('q'), ord('Q')):
+                break
+
+            elif key in (curses.KEY_UP, ord('k')):
+                if self.mode == "list":
+                    self.idx = max(0, self.idx - 1)
+                else:
+                    self.detail_scroll = max(0, self.detail_scroll - 1)
+
+            elif key in (curses.KEY_DOWN, ord('j')):
+                if self.mode == "list":
+                    self.idx = min(len(self.results) - 1, self.idx + 1)
+                else:
+                    max_scroll = max(0, len(self.detail_lines) - 10)
+                    self.detail_scroll = min(max_scroll, self.detail_scroll + 1)
+
+            elif key == curses.KEY_PPAGE:  # page up
+                if self.mode == "detail":
+                    h, *_ = self.dims()
+                    self.detail_scroll = max(0, self.detail_scroll - (h - 8))
+                else:
+                    self.idx = max(0, self.idx - 5)
+
+            elif key == curses.KEY_NPAGE:  # page down
+                if self.mode == "detail":
+                    h, *_ = self.dims()
+                    max_scroll = max(0, len(self.detail_lines) - 10)
+                    self.detail_scroll = min(max_scroll, self.detail_scroll + (h - 8))
+                else:
+                    self.idx = min(len(self.results) - 1, self.idx + 5)
+
+            elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+                if self.mode == "list" and self.results:
+                    self.mode = "detail"
+                    self.detail_lines = []
+                    self.detail_scroll = 0
+                    self.status = "Press r to load README/file"
+
+            elif key in (ord('b'), ord('B'), curses.KEY_BACKSPACE, 27):  # back / ESC
+                self.mode = "list"
+                self.status = ""
+
+            elif key in (ord('r'), ord('R')):
+                if self.mode == "detail":
+                    self.load_detail()
+                elif self.mode == "list" and self.results:
+                    self.mode = "detail"
+                    self.detail_lines = []
+                    self.load_detail()
+
+            elif key in (ord('c'), ord('C')):
+                self.do_clone()
+
+            elif key == curses.KEY_RESIZE:
+                curses.resizeterm(*self.scr.getmaxyx())
+
+
+# ── CLI & search orchestration ────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="vulnsearch",
+        description="CVE and PoC hunter with TUI — browse, view, and clone results",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+exploit type flags (mutually exclusive):
+  --rce   Remote Code Execution     --lfi   Local File Inclusion
+  --lpe   Local Privilege Escalation  --ssrf  Server-Side Request Forgery
+  --sqli  SQL Injection              --auth  Authentication Bypass
+  --dos   Denial of Service          --xxe   XXE Injection
+
+examples:
+  vulnsearch vesta
+  vulnsearch apache 2.4.49 --rce
+  vulnsearch nginx 1.14 --lpe
+  vulnsearch proftpd --no-github
+  vulnsearch openssh 7.4 --auth
+
+tui keys:
+  ↑↓ / j/k   navigate list / scroll detail
+  ENTER       open detail view
+  r           load README or exploit file
+  c           clone GitHub repo to /tmp
+  b / ESC     back to list
+  PgUp/PgDn   page through detail content
+  q           quit
+
+cache:
+  Results are cached to ~/.cache/vulnsearch for 24h by default.
+  --no-cache      bypass cache, force fresh search
+  --cache-clear   delete all cached results
+  --ttl HOURS     set cache TTL (default: 24)
+
+tip: export GITHUB_TOKEN=ghp_... for higher rate limits
+        """
+    )
+    p.add_argument("service", nargs="?", default="")
+    p.add_argument("version", nargs="?", default="")
+
+    tg = p.add_mutually_exclusive_group()
+    for key, meta in EXPLOIT_TYPES.items():
+        tg.add_argument(f"--{key}", action="store_true", default=False,
+                        help=f"Filter: {meta['label']} only")
+
+    p.add_argument("-f", "--fuzzy",    action="store_true",
+                   help="Fuzzy title matching in searchsploit")
+    p.add_argument("--no-searchsploit", action="store_true")
+    p.add_argument("--no-github",       action="store_true")
+    p.add_argument("--no-tui",          action="store_true",
+                   help="Print results to stdout without TUI")
+
+    # ── Cache flags ───────────────────────────────────────────────
+    p.add_argument("--no-cache",    action="store_true",
+                   help="Bypass cache and force fresh search")
+    p.add_argument("--cache-clear", action="store_true",
+                   help="Clear all cached results and exit")
+    p.add_argument("--ttl",         type=int, default=24, metavar="HOURS",
+                   help="Cache TTL in hours (default: 24)")
+
+    return p.parse_args()
+
+
+def get_active_type(args):
+    for key in EXPLOIT_TYPES:
+        if getattr(args, key, False):
+            return key, EXPLOIT_TYPES[key]
+    return None, None
+
+
+def relevance_score(r: Result, service: str, version: str,
+                    type_key: str | None) -> float:
+    """
+    Score a result 0-100 for relevance. Higher = more relevant.
+
+    Signals and weights:
+      - Service name match in title          (0-25)  exact > partial
+      - Version match in title/desc          (0-20)  exact > fuzzy
+      - Exploit type keyword match           (0-15)  if type filter active
+      - Recency                              (0-15)  newer is better
+      - Popularity                           (0-10)  stars / EDB-ID recency
+      - "poc"|"exploit" in name/title        (0-10)  signals a working PoC
+      - Source bonus: EDB gets slight boost  (0-5)   curated DB
+    """
+    score = 0.0
+    svc   = service.lower()
+    ver   = version.lower() if version else ""
+
+    title    = r.title.lower()
+    desc     = (r.desc or "").lower()
+    combined = f"{title} {desc}"
+
+    # ── Service name match (0-25) ─────────────────────────────────
+    svc_words = svc.split()
+    if svc in title:
+        score += 25
+    elif all(w in title for w in svc_words):
+        score += 18
+    elif any(w in title for w in svc_words):
+        score += 10
+    elif svc in desc:
+        score += 5
+
+    # ── Version match (0-20) ─────────────────────────────────────
+    if ver:
+        if ver in title:
+            score += 20
+        elif ver in desc:
+            score += 12
+        else:
+            # Fuzzy version match
+            tokens = re.findall(r'[\d]+(?:[._-][\w]+)*', combined)
+            best = max((version_score(t, ver) for t in tokens), default=0)
+            if best >= 0.8:
+                score += 10
+            elif best >= 0.6:
+                score += 5
+    else:
+        # No version — don't penalise, give neutral points
+        score += 8
+
+    # ── Exploit type keyword match (0-15) ────────────────────────
+    if type_key and type_key in EXPLOIT_TYPES:
+        kws = EXPLOIT_TYPES[type_key]["keywords"]
+        hits = sum(1 for kw in kws if kw in combined)
+        score += min(15, hits * 5)
+    else:
+        # Generic exploit signal
+        poc_kws = {"rce", "poc", "exploit", "shell", "lpe", "privesc",
+                   "injection", "bypass", "overflow"}
+        hits = sum(1 for kw in poc_kws if kw in combined)
+        score += min(8, hits * 2)
+
+    # ── Recency (0-15) ───────────────────────────────────────────
+    if r.kind == "github" and r.updated:
+        try:
+            import datetime
+            updated = datetime.date.fromisoformat(r.updated)
+            age_days = (datetime.date.today() - updated).days
+            if age_days < 90:
+                score += 15
+            elif age_days < 365:
+                score += 10
+            elif age_days < 730:
+                score += 5
+            else:
+                score += 2
+        except (ValueError, TypeError):
+            score += 3
+    elif r.kind == "searchsploit" and r.edb_id:
+        try:
+            # Higher EDB-ID = more recent submission
+            edb = int(r.edb_id)
+            if edb > 50000:
+                score += 15
+            elif edb > 40000:
+                score += 10
+            elif edb > 30000:
+                score += 5
+            else:
+                score += 2
+        except (ValueError, TypeError):
+            score += 3
+
+    # ── Popularity (0-10) ────────────────────────────────────────
+    if r.kind == "github":
+        stars = r.stars or 0
+        if stars >= 500:
+            score += 10
+        elif stars >= 100:
+            score += 8
+        elif stars >= 20:
+            score += 5
+        elif stars >= 5:
+            score += 3
+        elif stars >= 1:
+            score += 1
+
+    # ── PoC/exploit signal in name (0-10) ────────────────────────
+    poc_title_kws = {"poc", "exploit", "rce", "lpe", "cve", "vuln",
+                     "shell", "privesc", "bypass"}
+    title_hits = sum(1 for kw in poc_title_kws if kw in title)
+    score += min(10, title_hits * 3)
+
+    # ── Source bonus: searchsploit = curated (0-5) ───────────────
+    if r.kind == "searchsploit":
+        score += 5
+
+    return round(score, 2)
+
+
+def score_and_sort(results: list[Result], service: str, version: str,
+                   type_key: str | None) -> list[Result]:
+    """Score all results and return sorted by relevance descending."""
+    scored = [(r, relevance_score(r, service, version, type_key))
+              for r in results]
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # Attach score to result for display
+    for r, s in scored:
+        r._score = s
+
+    return [r for r, _ in scored]
+
+
+def run_search(args, type_key, type_def) -> tuple[list[Result], bool]:
+    """Returns (results, from_cache)."""
+    ttl      = getattr(args, "ttl", CACHE_TTL) * 3600
+    no_cache = getattr(args, "no_cache", False)
+
+    # ── Cache check ───────────────────────────────────────────────
+    key = _cache_key(args.service, args.version, type_key,
+                     args.no_github, args.no_searchsploit)
+    if not no_cache:
+        cached = cache_load(key, ttl)
+        if cached is not None:
+            age_h = (time.time() - os.path.getmtime(_cache_path(key))) / 3600
+            print(f"[cache hit — {age_h:.1f}h old, key={key}]")
+            scored = score_and_sort(dicts_to_results(cached), args.service, args.version, type_key)
+            return scored, True
+
+    # ── Live search ───────────────────────────────────────────────
+    results  = []
+    statuses = ["", ""]
+    threads  = []
+
+    if not args.no_github:
+        t = threading.Thread(
+            target=fetch_github,
+            args=(args.service, args.version, type_key, type_def, results, statuses),
+            daemon=True
+        )
+        threads.append(t)
+
+    if not args.no_searchsploit:
+        t = threading.Thread(
+            target=fetch_searchsploit,
+            args=(args.service, args.version, args.fuzzy, type_def, results, statuses),
+            daemon=True
+        )
+        threads.append(t)
+
+    for t in threads: t.start()
+
+    chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    i = 0
+    while any(t.is_alive() for t in threads):
+        print(f"\r{chars[i % len(chars)]} Searching...", end="", flush=True)
+        i += 1
+        time.sleep(0.1)
+    print("\r" + " " * 30 + "\r", end="")
+
+    for t in threads: t.join()
+
+    final = score_and_sort(results, args.service, args.version, type_key)
+
+    # ── Save to cache ─────────────────────────────────────────────
+    if not no_cache and final:
+        cache_save(key, results_to_dicts(final))
+
+    return final, False
+
+
+def print_plain(results: list[Result]):
+    """Fallback non-TUI output."""
+    gh = [r for r in results if r.kind == "github"]
+    ss = [r for r in results if r.kind == "searchsploit"]
+    if gh:
+        print(f"\n── GitHub PoCs ({len(gh)}) ──")
+        for r in gh:
+            print(f"  {r.title}  ★{r.stars}  {r.url}")
+            if r.desc: print(f"    {r.desc}")
+    if ss:
+        print(f"\n── SearchSploit ({len(ss)}) ──")
+        for r in ss:
+            print(f"  [{r.edb_id}] {r.title}  {r.url}")
+    if not results:
+        print("No results found.")
+
+
+def main():
+    args = parse_args()
+
+    # ── Cache clear ───────────────────────────────────────────────
+    if args.cache_clear:
+        n = cache_clear()
+        print(f"Cleared {n} cached result(s) from {CACHE_DIR}")
+        return
+
+    if not args.service:
+        print("error: service is required", file=sys.stderr)
+        sys.exit(1)
+
+    type_key, type_def = get_active_type(args)
+
+    label = f"{args.service} {args.version}".strip()
+    if type_key:
+        label += f"  [{EXPLOIT_TYPES[type_key]['label']}]"
+
+    print(f"vulnsearch — {label}")
+    results, from_cache = run_search(args, type_key, type_def)
+    src = "cache" if from_cache else "live"
+    print(f"Found {len(results)} results [{src}]")
+
+    if args.no_tui or not results:
+        print_plain(results)
+        return
+
+    try:
+        curses.wrapper(lambda scr: TUI(scr, results, label).run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
