@@ -13,6 +13,9 @@ source of truth for:
 import html
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +72,32 @@ def chown_project_dir(out_dir) -> None:
             except OSError:
                 pass
 
+# ── Privileges ──────────────────────────────────────────────────────────────
+def nmap_needs_sudo() -> bool:
+    """
+    False if nmap can already do SYN/UDP scans without elevation — either
+    we're already root, or `setup_caps.sh` has granted the nmap binary
+    itself CAP_NET_RAW/CAP_NET_ADMIN directly (see that script). True
+    otherwise, meaning the old sudo-wrapped behavior is still needed.
+
+    Checking this matters because passing sudo=True to python-nmap when
+    it's NOT needed doesn't just do nothing — it actively tries to invoke
+    `sudo nmap ...`, which will hang on a password prompt (or fail outright)
+    for someone who deliberately set up capabilities specifically to avoid
+    needing sudo at all.
+    """
+    if hasattr(os, 'geteuid') and os.geteuid() == 0:
+        return False
+    nmap_path = shutil.which('nmap')
+    if not nmap_path:
+        return True  # let the actual scan call fail with a clear "not found" error
+    try:
+        real_path = os.path.realpath(nmap_path)
+        result = subprocess.run(['getcap', real_path], capture_output=True, text=True, timeout=3)
+        return 'cap_net_raw' not in result.stdout
+    except Exception:
+        return True  # can't tell -> fall back to the old sudo-required behavior
+
 # ── Manifest ──────────────────────────────────────────────────────────────────
 # This JSON file is the single source of truth for both scripts. recon_scan.py
 # writes scan-derived fields (ports, exploits, os, etc). recon_server.py writes
@@ -78,9 +107,11 @@ def manifest_path(out_dir) -> Path:
     return Path(out_dir) / 'scans' / '.manifest.json'
 
 def ensure_project_dirs(out_dir) -> Path:
-    """Create the project's scans/notes layout. Safe to call on an existing project."""
+    """Create the project's scans/notes/work layout. Safe to call on an
+    existing project. 'work' is a scratch space for you to use freely —
+    nothing in this codebase ever reads from or writes to it."""
     out_dir = Path(out_dir)
-    for d in ['scans/nmap', 'scans/searchsploit', 'scans/html', 'notes']:
+    for d in ['scans/nmap', 'scans/searchsploit', 'scans/html', 'notes', 'work']:
         (out_dir / d).mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -105,8 +136,9 @@ def merge_scan_results(existing: dict, new_results: list) -> dict:
     Merge freshly-scanned host results into the existing manifest.
     Scan-derived fields (ports/exploits/os/services/etc) come from the new
     scan. 'local'/'proof' flags (and the timestamp of when each was set),
-    'credentials', and 'ferox' results are only ever set from the
-    dashboard, so they are always carried forward from the existing record.
+    'credentials', 'ferox' results, and 'bloodhound' results are only ever
+    set from the dashboard, so they are always carried forward from the
+    existing record.
     """
     merged = dict(existing)
     for r in new_results:
@@ -120,6 +152,9 @@ def merge_scan_results(existing: dict, new_results: list) -> dict:
         r['ferox'] = old.get('ferox', [])
         r['ferox_target_url'] = old.get('ferox_target_url')
         r['ferox_scanned_at'] = old.get('ferox_scanned_at')
+        r['bloodhound_domain'] = old.get('bloodhound_domain')
+        r['bloodhound_scanned_at'] = old.get('bloodhound_scanned_at')
+        r['bloodhound_summary'] = old.get('bloodhound_summary', {})
         merged[r['host']] = r
     return merged
 
@@ -186,11 +221,12 @@ def append_cred_to_note(out_dir, host: str, cred: dict) -> None:
 
 def write_creds_files(out_dir, manifest: dict) -> None:
     """
-    Mirror every tracked credential out to plain-text 'user:secret' files —
-    the same format spray-all.sh expects — so creds added via the dashboard
-    are immediately usable with nxc, no manual copy-paste needed.
+    Mirror every tracked credential out to plain-text files for use with
+    other manual tools — no copy-pasting out of the dashboard needed:
 
-        <out_dir>/creds.txt               all creds, deduped, across every host
+        <out_dir>/creds.txt               all creds, deduped, as user:secret
+        <out_dir>/users.txt                just usernames, deduped
+        <out_dir>/passwords.txt            just secrets (passwords + hashes), deduped
         <out_dir>/scans/creds/<safe>.txt  just this host's creds
 
     Call this after any add/edit/delete of a credential, and once at
@@ -200,8 +236,8 @@ def write_creds_files(out_dir, manifest: dict) -> None:
     creds_dir = out_dir / 'scans' / 'creds'
     creds_dir.mkdir(parents=True, exist_ok=True)
 
-    seen = set()
-    global_lines = []
+    seen_pairs, seen_users, seen_secrets = set(), set(), set()
+    global_lines, user_lines, secret_lines = [], [], []
 
     for host, r in manifest.items():
         creds = r.get('credentials', [])
@@ -216,15 +252,43 @@ def write_creds_files(out_dir, manifest: dict) -> None:
 
         for c in creds:
             pair = f"{c['username']}:{c['secret']}"
-            if pair not in seen:
-                seen.add(pair)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
                 global_lines.append(pair)
+            if c['username'] not in seen_users:
+                seen_users.add(c['username'])
+                user_lines.append(c['username'])
+            if c['secret'] not in seen_secrets:
+                seen_secrets.add(c['secret'])
+                secret_lines.append(c['secret'])
 
-    global_path = out_dir / 'creds.txt'
-    if global_lines:
-        global_path.write_text('\n'.join(global_lines) + '\n', encoding='utf-8')
-    elif global_path.exists():
-        global_path.unlink()
+    def _write_or_remove(path, lines):
+        if lines:
+            path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        elif path.exists():
+            path.unlink()
+
+    _write_or_remove(out_dir / 'creds.txt', global_lines)
+    _write_or_remove(out_dir / 'users.txt', user_lines)
+    _write_or_remove(out_dir / 'passwords.txt', secret_lines)
+
+
+def write_targets_file(out_dir, manifest: dict) -> None:
+    """
+    Mirror every scanned host out to <out_dir>/targets.txt, one IP per
+    line — for use with other manual tools (nmap, nxc, hydra -M, etc)
+    without needing to copy-paste out of the dashboard.
+
+    Call this any time the manifest's host list changes: after a scan
+    completes, after a host delete, and after a remap.
+    """
+    out_dir = Path(out_dir)
+    targets_path = out_dir / 'targets.txt'
+    hosts = sorted(manifest.keys())
+    if hosts:
+        targets_path.write_text('\n'.join(hosts) + '\n', encoding='utf-8')
+    elif targets_path.exists():
+        targets_path.unlink()
 
 
 # ── Exploit classification / service badges ───────────────────────────────────
@@ -265,6 +329,18 @@ def svc_badge(name):
     return "<span style='color:var(--muted)'>unknown</span>"
 
 # ── Flag chips (Local / Proof) ─────────────────────────────────────────────────
+def parse_domain_from_note(note_text: str) -> str:
+    """Pulls the Domain / Workgroup value out of a host note's System
+    Information table. Shared by recon_report_docx.py (bucketing hosts
+    into Independent Challenges vs Active Directory Set) and the
+    dashboard's BloodHound feature (auto-filling the domain field)."""
+    if not note_text:
+        return ''
+    m = re.search(r'##\s*System Information.*?\|\s*\*\*Domain / Workgroup\*\*\s*\|\s*(.*?)\s*\|',
+                   note_text, re.DOTALL)
+    return m.group(1).strip() if m else ''
+
+
 def render_flag_chips(host, local, proof, interactive):
     """
     Renders the Local/Proof status chips for a host card.

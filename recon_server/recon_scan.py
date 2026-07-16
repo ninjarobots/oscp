@@ -10,6 +10,7 @@ already-written per-host Obsidian notes are all preserved/updated in place.
 
 import argparse
 import concurrent.futures
+import ipaddress
 import json
 import os
 import re
@@ -30,6 +31,7 @@ try:
         R, G, Y, C, B, X, log, ok, warn, err, h, classify, svc_badge, CSS,
         manifest_path, load_manifest, save_manifest, merge_scan_results,
         render_flag_chips, ensure_project_dirs, chown_project_dir,
+        write_creds_files, write_targets_file, nmap_needs_sudo,
     )
 except ImportError:
     print("[-] recon_common.py not found. Keep it in the same directory as recon_scan.py")
@@ -58,6 +60,12 @@ def parse_args():
                    help='Nmap port args (default: --top-ports 10000)')
     p.add_argument('--no-udp', action='store_true', default=False,
                    help='Skip UDP scan phase (UDP scanning requires root)')
+    p.add_argument('--proxy-port', type=int, default=9050,
+                   help='SOCKS port to use via proxychains for targets with no direct route in the '
+                        'kernel routing table (e.g. reachable only through an SSH -D / chisel-style '
+                        'SOCKS tunnel, not a route-based one like ligolo-ng). Default: 9050. Every '
+                        'scan checks routability per-target automatically — this only matters for '
+                        'targets that actually need the proxy fallback.')
     return p.parse_args()
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
@@ -119,29 +127,149 @@ UDP_PORTS = [
 ]
 UDP_PORT_ARG = ','.join(str(p) for p in UDP_PORTS)
 
+# ── Proxy routing (ligolo-ng/sshuttle-style tunnels vs SOCKS proxychains) ──────
+def has_specific_route(target: str) -> bool:
+    """
+    True if the kernel routing table has a route to target more specific
+    than the generic default route — either the host is genuinely
+    on-link, or you've already set up a route-based tunnel for it
+    (ligolo-ng `ip route add 10.5.5.0/24 dev ligolo`, sshuttle, etc), so
+    nmap can just reach it directly with no proxy involved.
+
+    False means the ONLY way there is the default route, which on a
+    typical OSCP attack box just goes out the VPN adapter and won't
+    actually reach an internal pivot target — that's the signal to wrap
+    the scan in proxychains instead (dynamic SSH/chisel-style SOCKS
+    tunnels don't add a kernel route, so they'd never show up here).
+
+    A CIDR target (e.g. scanning a whole /24) is treated as needing a
+    specific route for the network address itself — if that's not
+    routable, the same all-hosts-covered-by-a-tunnel logic still applies.
+    Fails safe (returns False -> use proxy) if the check itself fails for
+    any reason, e.g. `ip` not found, non-Linux host, permission issue.
+    """
+    try:
+        addr = ipaddress.ip_network(target, strict=False).network_address
+    except ValueError:
+        return False
+
+    try:
+        result = subprocess.run(
+            ['ip', '-4', 'route', 'show'],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode != 0:
+            return False
+        for line in result.stdout.splitlines():
+            prefix = line.split()[0] if line.split() else ''
+            if not prefix or prefix == 'default':
+                continue
+            try:
+                net = ipaddress.ip_network(prefix, strict=False)
+            except ValueError:
+                continue
+            # Belt-and-suspenders: skip any /0 catch-all regardless of how
+            # it's written. `ip route show` conventionally prints the
+            # default route as the literal word "default", but treating
+            # 0.0.0.0/0 as "specific" here would make this function return
+            # True for every possible target — silently defeating the
+            # entire point of this check — so don't rely on the string
+            # match alone.
+            if net.prefixlen == 0:
+                continue
+            if addr in net:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _proxied_nmap_scan(nm, target, cmd_args, xml_path, proxy_port):
+    """
+    Runs `proxychains -q -f <temp config for proxy_port> nmap <cmd_args>`
+    directly (bypassing python-nmap's own scan() call, which has no way to
+    prefix the binary with proxychains) and feeds the resulting XML back
+    into the given PortScanner object via analyse_nmap_xml_scan — so the
+    rest of the pipeline sees the exact same kind of object either way,
+    proxied or not.
+
+    A temp config is generated per call (rather than relying on whatever
+    /etc/proxychains.conf already has) so --proxy-port actually controls
+    which port gets used instead of being silently ignored. SOCKS5 is
+    assumed — that's what SSH dynamic port forwarding (`ssh -D`) and
+    chisel both expose, which is the realistic case here (a route-based
+    tunnel like ligolo-ng wouldn't hit this code path at all, since
+    has_specific_route() would already be True for it).
+    """
+    import tempfile
+    config = f"strict_chain\nproxy_dns\n[ProxyList]\nsocks5 127.0.0.1 {proxy_port}\n"
+    with tempfile.NamedTemporaryFile('w', suffix='.proxychains.conf', delete=False) as f:
+        f.write(config)
+        config_path = f.name
+
+    try:
+        proc = subprocess.run(
+            ['proxychains', '-q', '-f', config_path, 'nmap'] + cmd_args + ['-oX', str(xml_path), target],
+            capture_output=True, text=True
+        )
+    finally:
+        try:
+            os.unlink(config_path)
+        except OSError:
+            pass
+
+    if not xml_path.exists():
+        raise RuntimeError(f"proxychains nmap produced no output (exit {proc.returncode}): {proc.stderr[-300:]}")
+    nm.analyse_nmap_xml_scan(nmap_xml_output=xml_path.read_text(encoding='utf-8', errors='ignore'))
+    return nm
+
+
 # ── Nmap scan ─────────────────────────────────────────────────────────────────
-def scan_tcp(target, out_dir, port_args):
+def scan_tcp(target, out_dir, port_args, proxy_port=9050):
     """TCP service version scan with default scripts."""
     safe     = target.replace('/', '_').replace('.', '-')
     xml_path = out_dir / 'scans' / 'nmap' / f"{safe}.xml"
 
     nm = nmap.PortScanner()
+    needs_proxy = not has_specific_route(target)
     try:
-        nm.scan(hosts=target, arguments=f"-sV -sC {port_args} --open", sudo=True)
-        nm.csv()
-        subprocess.run(
-            ['nmap', '-sV', '-sC'] + port_args.split() +
-            ['--open', '-oX', str(xml_path), target],
-            capture_output=True, text=True
-        )
+        if needs_proxy:
+            # -Pn: ping-based discovery doesn't work through a SOCKS proxy
+            # (no raw ICMP), so skip it and just assume the host is up.
+            # -sT: proxychains can only intercept userspace connect() calls
+            # — nmap's default SYN scan uses a raw socket that bypasses it
+            # entirely, so a SYN scan through proxychains silently returns
+            # nothing useful. TCP connect scan is the only mode that
+            # actually works here.
+            warn(f"{target}: no specific route found — routing this scan through "
+                 f"proxychains (SOCKS on port {proxy_port}, forcing -sT)")
+            cmd_args = ['-sT', '-sV', '-sC', '-Pn'] + port_args.split() + ['--open']
+            nm = _proxied_nmap_scan(nm, target, cmd_args, xml_path, proxy_port)
+        else:
+            nm.scan(hosts=target, arguments=f"-sV -sC -Pn {port_args} --open", sudo=nmap_needs_sudo())
+            nm.csv()
+            subprocess.run(
+                ['nmap', '-sV', '-sC', '-Pn'] + port_args.split() +
+                ['--open', '-oX', str(xml_path), target],
+                capture_output=True, text=True
+            )
     except Exception as e:
         warn(f"TCP scan error for {target}: {e}")
         return None
     return nm
 
 
-def scan_udp(target, out_dir):
-    """UDP scan against high-value ports. Requires root."""
+def scan_udp(target, out_dir, proxy_port=9050):
+    """UDP scan against high-value ports. Requires root.
+
+    Skipped entirely for proxied targets — proxychains only handles TCP
+    connect() calls, there's no way to tunnel a UDP scan through it, so
+    attempting one would just hang or silently return nothing.
+    """
+    if not has_specific_route(target):
+        warn(f"{target}: no specific route — skipping UDP (can't be tunneled through proxychains)")
+        return None
+
     safe     = target.replace('/', '_').replace('.', '-')
     xml_path = out_dir / 'scans' / 'nmap' / f"{safe}_udp.xml"
 
@@ -149,12 +277,12 @@ def scan_udp(target, out_dir):
     try:
         nm_udp.scan(
             hosts=target,
-            arguments=f"-sU -sV --open -p {UDP_PORT_ARG}",
-            sudo=True
+            arguments=f"-sU -sV -Pn --open -p {UDP_PORT_ARG}",
+            sudo=nmap_needs_sudo()
         )
         nm_udp.csv()
         subprocess.run(
-            ['nmap', '-sU', '-sV', '--open',
+            ['nmap', '-sU', '-sV', '-Pn', '--open',
              '-p', UDP_PORT_ARG,
              '-oX', str(xml_path), target],
             capture_output=True, text=True
@@ -190,11 +318,11 @@ def merge_scans(nm_tcp, nm_udp, host):
     return nm_tcp
 
 
-def scan_target(target, out_dir, port_args, do_udp=True):
+def scan_target(target, out_dir, port_args, do_udp=True, proxy_port=9050):
     safe = target.replace('/', '_').replace('.', '-')
     log(f"Scanning TCP: {target}")
 
-    nm = scan_tcp(target, out_dir, port_args)
+    nm = scan_tcp(target, out_dir, port_args, proxy_port=proxy_port)
     if nm is None:
         return None, safe
 
@@ -202,7 +330,7 @@ def scan_target(target, out_dir, port_args, do_udp=True):
 
     if do_udp:
         log(f"Scanning UDP: {target}")
-        nm_udp = scan_udp(target, out_dir)
+        nm_udp = scan_udp(target, out_dir, proxy_port=proxy_port)
         if nm_udp is not None:
             udp_count = len(nm_udp[target].get('udp', {})) if target in nm_udp.all_hosts() else 0
             ok(f"UDP done: {target} ({udp_count} open|filtered port(s))")
@@ -754,6 +882,8 @@ def render_target_html(nm, host, safe, out_dir):
 
     # ── Detected web services (for the Feroxbuster protocol/port dropdowns) ──
     web_endpoints = []  # list of (scheme, port), in detection order
+    is_dc = False  # LDAP present -> this host is (probably) a domain controller
+    LDAP_PORTS = {389, 636, 3268, 3269}
     for proto in host_data.all_protocols() if hasattr(host_data, 'all_protocols') else []:
         for port in sorted(host_data[proto].keys()):
             svc = host_data[proto][port]
@@ -764,6 +894,8 @@ def render_target_html(nm, host, safe, out_dir):
                 web_endpoints.append(('https', port))
             elif 'http' in name:
                 web_endpoints.append(('http', port))
+            if port in LDAP_PORTS or 'ldap' in name:
+                is_dc = True
 
     # ── Feroxbuster card ──────────────────────────────────────────────────────
     # Only shown when we actually detected a web service — no point offering
@@ -898,6 +1030,101 @@ loadFerox();
         ferox_section = ''
         ferox_js = ''
 
+    if is_dc:
+        bloodhound_js = """
+function renderBloodhoundResults(data) {
+  const body = document.getElementById('bloodhound-results-body');
+  const countEl = document.getElementById('bloodhound-result-count');
+  if (!data || !data.scanned_at) {
+    body.innerHTML = '<span class="empty-msg">No scan run yet.</span>';
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+  if (countEl) countEl.textContent = '(' + data.scanned_at + ')';
+  const summary = data.summary || {};
+  const summaryText = Object.keys(summary).length
+    ? Object.entries(summary).map(([k, v]) => `${v} ${k}`).join(', ')
+    : 'collection complete';
+  body.innerHTML = `
+    <p style="margin:8px 0">${escapeHtml(summaryText)} &mdash; domain: ${escapeHtml(data.domain || '')}</p>
+    <a class="scan-field" style="text-decoration:none;display:inline-block" href="${escapeHtmlAttr(data.zip_url)}" download>&#11015; Download BloodHound ZIP</a>
+  `;
+}
+function loadBloodhound() {
+  fetch('/api/bloodhound/' + encodeURIComponent(HOST))
+    .then(r => { if (!r.ok) throw new Error('no server'); return r.json(); })
+    .then(data => {
+      const credSelect = document.getElementById('bloodhound-cred');
+      const submitBtn = document.getElementById('bloodhound-submit');
+      const hint = document.getElementById('bloodhound-hint');
+      const domainField = document.getElementById('bloodhound-domain');
+
+      if (data.credentials && data.credentials.length) {
+        credSelect.innerHTML = data.credentials.map(c =>
+          `<option value="${escapeHtmlAttr(c.source_host)}::${escapeHtmlAttr(c.cred_id)}">${escapeHtml(c.username)} (${escapeHtml(c.status)}, via ${escapeHtml(c.source_host)})</option>`
+        ).join('');
+        credSelect.disabled = false;
+        submitBtn.disabled = false;
+        hint.textContent = 'Pick a credential confirmed to work over LDAP, confirm the domain, and start the scan.';
+      } else {
+        credSelect.innerHTML = '<option value="">No valid LDAP credentials yet</option>';
+        credSelect.disabled = true;
+        submitBtn.disabled = true;
+        hint.textContent = 'Spray a credential against LDAP (or manually mark one valid for the ldap service) to enable BloodHound collection.';
+      }
+
+      if (data.suggested_domain && !domainField.value) {
+        domainField.value = data.suggested_domain;
+      }
+
+      renderBloodhoundResults(data.last_run);
+    })
+    .catch(() => {
+      document.getElementById('bloodhound-hint').textContent = 'Live dashboard required \u2014 run recon_server.py';
+    });
+}
+let bloodhoundPolling = false;
+function startBloodhound(evt) {
+  evt.preventDefault();
+  const credVal = document.getElementById('bloodhound-cred').value;
+  if (!credVal) { alert('No credential selected'); return; }
+  const [sourceHost, credId] = credVal.split('::');
+  const body = {
+    source_host: sourceHost,
+    cred_id: credId,
+    domain: document.getElementById('bloodhound-domain').value,
+    dc: document.getElementById('bloodhound-dc').value,
+  };
+  fetch('/api/bloodhound/' + encodeURIComponent(HOST), {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+  })
+  .then(r => { if (!r.ok) return r.json().then(d => { throw new Error(d.description || 'failed to start scan'); }); return r.json(); })
+  .then(() => {
+    document.getElementById('bloodhound-submit').disabled = true;
+    document.getElementById('bloodhound-progress').style.display = 'block';
+    bloodhoundPolling = true;
+    pollBloodhoundStatus();
+  })
+  .catch(e => alert('Could not start BloodHound scan: ' + e.message));
+}
+function pollBloodhoundStatus() {
+  fetch('/api/bloodhound/status').then(r => r.json()).then(s => {
+    document.getElementById('bloodhound-progress-text').textContent = s.running ? 'Collecting\u2026' : 'Done';
+    document.getElementById('bloodhound-log').textContent = (s.log || []).slice(-30).join('\\n');
+    if (s.running) {
+      setTimeout(pollBloodhoundStatus, 1500);
+    } else if (bloodhoundPolling) {
+      bloodhoundPolling = false;
+      document.getElementById('bloodhound-submit').disabled = false;
+      loadBloodhound();
+    }
+  }).catch(() => {});
+}
+loadBloodhound();
+"""
+    else:
+        bloodhound_js = ''
+
     # ── Note download / host delete toolbar ──────────────────────────────────
     note_rel_path = f"../../notes/{host}.md"
     host_toolbar = f"""
@@ -944,6 +1171,37 @@ loadFerox();
       </table>
     </div>
   </div>"""
+
+    # ── BloodHound card — only for hosts that look like a domain controller ──
+    if is_dc:
+        bloodhound_section = """
+  <div class="card">
+    <div class="card-header"><h2>&#128021; BloodHound</h2></div>
+    <div class="card-body">
+      <p class="subtitle" id="bloodhound-hint" style="margin:0 0 10px">Checking for valid LDAP credentials&hellip;</p>
+      <form id="bloodhound-form" onsubmit="startBloodhound(event)" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <select class="scan-field" id="bloodhound-cred" style="min-width:220px" disabled>
+          <option value="">No valid LDAP credentials yet</option>
+        </select>
+        <input class="scan-field" id="bloodhound-domain" placeholder="domain (e.g. THINC.LOCAL)" style="width:170px">
+        <input class="scan-field" id="bloodhound-dc" placeholder="DC hostname (optional)" style="width:170px">
+        <button type="submit" id="bloodhound-submit" class="scan-field" style="background:var(--green);color:#0d1117;font-weight:700;cursor:pointer;border:none" disabled>Start Scan</button>
+      </form>
+      <div id="bloodhound-progress" style="display:none;margin-top:10px">
+        <div class="progress-label"><span id="bloodhound-progress-text"></span></div>
+        <pre id="bloodhound-log" style="margin-top:6px;max-height:150px;overflow-y:auto;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px 10px;font-size:11px;color:var(--muted);white-space:pre-wrap"></pre>
+      </div>
+      <div class="section-toggle" onclick="document.getElementById('bloodhound-results-wrap').classList.toggle('section-collapsed')">
+        <strong style="font-size:13px">Results</strong>
+        <span id="bloodhound-result-count" style="color:var(--muted);font-size:12px"></span>
+      </div>
+      <div id="bloodhound-results-wrap">
+        <p id="bloodhound-results-body" class="empty-msg" style="margin-top:8px">No scan run yet.</p>
+      </div>
+    </div>
+  </div>"""
+    else:
+        bloodhound_section = ''
 
     # ── Inline JS (credentials CRUD + delete host) ───────────────────────────
     # Built as a plain string (not an f-string) so JS braces don't need escaping,
@@ -1005,7 +1263,7 @@ function addCred(evt) {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
   })
   .then(r => { if (!r.ok) throw new Error('save failed'); return r.json(); })
-  .then(data => { renderCreds(data.credentials); document.getElementById('cred-form').reset(); })
+  .then(data => { renderCreds(data.credentials); document.getElementById('cred-form').reset(); if (typeof loadBloodhound === 'function') loadBloodhound(); })
   .catch(() => alert('Could not save credential — is recon_server.py running?'));
 }
 function deleteCred(id) {
@@ -1045,6 +1303,7 @@ function pollSpraySilently(credId, btn) {
       showToast('Spray complete \u2014 ' + (s.hits ? s.hits.length : 0) + ' hit(s). Full results on the Credentials page.');
       loadCreds();
       loadPwns();
+      if (typeof loadBloodhound === 'function') loadBloodhound();
     }
   }).catch(() => {
     spraySilentPoll = false;
@@ -1089,10 +1348,12 @@ function escapeHtmlAttr(s) {
 }
 loadCreds();
 loadPwns();
+BLOODHOUND_JS_PLACEHOLDER
 FEROX_JS_PLACEHOLDER
 </script>
 """
-    script_js = script_js.replace('HOST_PLACEHOLDER', json.dumps(host)).replace('FEROX_JS_PLACEHOLDER', ferox_js)
+    script_js = script_js.replace('HOST_PLACEHOLDER', json.dumps(host)).replace(
+        'FEROX_JS_PLACEHOLDER', ferox_js).replace('BLOODHOUND_JS_PLACEHOLDER', bloodhound_js)
 
     # ── Assemble page ─────────────────────────────────────────────────────────
     page = f"""<!DOCTYPE html>
@@ -1145,6 +1406,7 @@ FEROX_JS_PLACEHOLDER
     <div class="card-body">{ss_html}</div>
   </div>
   {creds_section}
+  {bloodhound_section}
   {ferox_section}
 </div>
 <footer>recon_scan.py &nbsp;&middot;&nbsp; Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</footer>
@@ -1668,10 +1930,10 @@ function filterCards() {{
 
 # ── Worker ────────────────────────────────────────────────────────────────────
 def process_target(args_tuple):
-    target, out_dir, port_args, do_udp = args_tuple
+    target, out_dir, port_args, do_udp, proxy_port = args_tuple
     safe = target.replace('/', '_').replace('.', '-')
 
-    nm, safe = scan_target(target, out_dir, port_args, do_udp=do_udp)
+    nm, safe = scan_target(target, out_dir, port_args, do_udp=do_udp, proxy_port=proxy_port)
     if nm is None:
         return {
             'host': target, 'safe': safe,
@@ -1729,7 +1991,7 @@ def main():
     print()
 
     do_udp = not args.no_udp
-    work = [(t, out_dir, args.ports, do_udp) for t in targets]
+    work = [(t, out_dir, args.ports, do_udp, args.proxy_port) for t in targets]
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
         futures = {ex.submit(process_target, w): w[0] for w in work}
@@ -1749,6 +2011,8 @@ def main():
     render_index(all_results, out_dir, scan_start)
     render_obsidian_summary(all_results, out_dir, scan_start)
     save_manifest(out_dir, merged)
+    write_targets_file(out_dir, merged)
+    write_creds_files(out_dir, merged)
     chown_project_dir(out_dir)
     print()
     print(f"{B}{G}Done.{X} Open: {C}{out_dir}/index.html{X}")

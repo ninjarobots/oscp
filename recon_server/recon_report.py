@@ -59,10 +59,12 @@ def load_note(project_dir: Path, host: str) -> str:
 
 def host_status_label(r: dict) -> str:
     local, proof = bool(r.get('local')), bool(r.get('proof'))
-    if local and proof:
-        return 'Fully owned'
+    # proof.txt means root/SYSTEM — that's full ownership on its own. Plenty
+    # of boxes (most AD ones, some web-app boxes) go straight there with no
+    # separate low-priv shell along the way, so local.txt never gets set —
+    # requiring both flags would wrongly demote those to "Proof only".
     if proof:
-        return 'Proof only'
+        return 'Fully owned'
     if local:
         return 'Local only'
     return 'Not flagged'
@@ -115,13 +117,13 @@ def build_report(project_dir: Path, include_all: bool, full_sections: bool) -> s
         lines.append('')
 
     total_hosts = len(results)
-    fully_owned = sum(1 for r in results if r.get('local') and r.get('proof'))
+    fully_owned = sum(1 for r in results if r.get('proof'))
     total_creds = sum(len(r.get('credentials', [])) for r in results)
 
     lines.append('## Executive Summary')
     lines.append('')
     lines.append(f"- **Hosts included:** {total_hosts}")
-    lines.append(f"- **Fully owned (Local + Proof):** {fully_owned}")
+    lines.append(f"- **Fully owned (Proof captured):** {fully_owned}")
     lines.append(f"- **Credentials recorded:** {total_creds}")
     lines.append('')
     lines.append('_Ordered by when access was gained (Local flag timestamp, falling back to Proof) — not alphabetically._')

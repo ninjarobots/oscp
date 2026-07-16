@@ -16,7 +16,10 @@ Keep recon_common.py AND recon_scan.py in the same directory as this file —
 scanning re-uses recon_scan.py's scan/report/notes-generation code directly.
 """
 import argparse
+import base64
 import concurrent.futures
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -26,7 +29,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -39,8 +45,8 @@ except ImportError:
 try:
     from recon_common import (
         h, load_manifest, save_manifest, manifest_path, ensure_project_dirs,
-        merge_scan_results, write_creds_files, append_cred_to_note, render_flag_chips,
-        chown_project_dir, CSS, log, ok, warn, err, C, G, X, B,
+        merge_scan_results, write_creds_files, write_targets_file, append_cred_to_note, render_flag_chips,
+        chown_project_dir, parse_domain_from_note, nmap_needs_sudo, CSS, log, ok, warn, err, C, G, X, B,
     )
 except ImportError:
     print("[-] recon_common.py not found. Keep it in the same directory as recon_server.py")
@@ -67,6 +73,8 @@ except ImportError as e:
 
 app = Flask(__name__)
 PROJECT_DIR = None
+PROXY_PORT = 9050  # overridable via --proxy-port; used for proxychains-fallback scans
+BLOODHOUND_CE = None  # dict {host, token_id, token_key} if --bh-host/--bh-key-id/--bh-key were all provided, else None
 MANIFEST_LOCK = threading.Lock()
 
 SCAN_STATE = {
@@ -99,6 +107,42 @@ FEROX_STATE = {
 FEROX_STATE_LOCK = threading.Lock()
 FEROX_DEFAULT_WORDLIST = '/usr/share/wordlists/dirb/common.txt'
 
+# ── BloodHound ───────────────────────────────────────────────────────────────
+BLOODHOUND_STATE = {
+    'running': False, 'host': None, 'log': [],
+    'started_at': None, 'finished_at': None, 'error': None,
+}
+BLOODHOUND_STATE_LOCK = threading.Lock()
+BLOODHOUND_VALID_STATUSES = {'valid', 'valid-admin', 'valid-admin-uncertain'}
+
+
+def find_ldap_credentials(manifest, target_host):
+    """Every credential anywhere in the project that's confirmed to work
+    over LDAP against target_host — either via a spray hit (protocol=ldap,
+    target=target_host) or a manually-set 'ldap' service + valid status on
+    its own host record. Best (valid-admin) first."""
+    status_rank = {'valid-admin': 0, 'valid-admin-uncertain': 1, 'valid': 2}
+    found = []
+    for source_host, r in manifest.items():
+        for c in r.get('credentials', []):
+            has_spray_hit = any(
+                h.get('target') == target_host and h.get('protocol') == 'ldap'
+                for h in c.get('spray_results', [])
+            )
+            manual_match = (
+                'ldap' in (c.get('service') or '').lower()
+                and c.get('status') in BLOODHOUND_VALID_STATUSES
+                and source_host == target_host
+            )
+            if has_spray_hit or manual_match:
+                found.append({
+                    'source_host': source_host, 'cred_id': c['id'],
+                    'username': c.get('username', ''), 'secret': c.get('secret', ''),
+                    'type': c.get('type', 'password'), 'status': c.get('status', 'untested'),
+                })
+    found.sort(key=lambda c: status_rank.get(c['status'], 3))
+    return found
+
 
 def manifest_mtime():
     mpath = manifest_path(PROJECT_DIR)
@@ -106,7 +150,7 @@ def manifest_mtime():
 
 
 # ── Background scan job ────────────────────────────────────────────────────────
-def run_scan_job(targets, threads, port_args, do_udp):
+def run_scan_job(targets, threads, port_args, do_udp, proxy_port):
     with STATE_LOCK:
         SCAN_STATE.update(
             running=True, total=len(targets), done=0, remaining=list(targets),
@@ -115,7 +159,7 @@ def run_scan_job(targets, threads, port_args, do_udp):
         )
     scan_start = datetime.now()
     try:
-        work = [(t, PROJECT_DIR, port_args, do_udp) for t in targets]
+        work = [(t, PROJECT_DIR, port_args, do_udp, proxy_port) for t in targets]
         with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
             futures = {ex.submit(rs.process_target, w): w[0] for w in work}
             for fut in concurrent.futures.as_completed(futures):
@@ -154,6 +198,8 @@ def run_scan_job(targets, threads, port_args, do_udp):
         all_results = sorted(manifest.values(), key=lambda r: r['host'])
         rs.render_index(all_results, PROJECT_DIR, scan_start)
         rs.render_obsidian_summary(all_results, PROJECT_DIR, scan_start)
+        write_targets_file(PROJECT_DIR, manifest)
+        write_creds_files(PROJECT_DIR, manifest)
         with STATE_LOCK:
             SCAN_STATE['log'].append("Scan complete.")
     except Exception as e:
@@ -330,11 +376,16 @@ def run_spray_job(spray_targets, label):
                     if c.get('id') == cred['cred_id']:
                         c['spray_results'] = hits
                         c['last_sprayed_at'] = datetime.now().isoformat()
-                        # Reflect what the spray actually found. Only ever
-                        # upgrades status on a hit — zero hits doesn't
-                        # necessarily mean the cred is bad (could just be
-                        # untried against the right host/protocol yet), so
-                        # we don't auto-downgrade a status you set by hand.
+                        # Spray always tests every currently-known host across
+                        # every supported protocol, so zero hits is a real,
+                        # meaningful result — not "not yet tried" — and
+                        # leaving it stuck at "untested" forever makes it
+                        # indistinguishable from a credential nobody has ever
+                        # sprayed. Only auto-set for creds still sitting at
+                        # the default, though: never downgrade a status that
+                        # was already confirmed valid (by an earlier spray or
+                        # by hand) just because this one run came back empty
+                        # — that could just be a host being temporarily down.
                         if hits:
                             confident_admin = any(hit.get('admin') and not hit.get('admin_uncertain') for hit in hits)
                             any_admin = any(hit.get('admin') for hit in hits)
@@ -344,6 +395,8 @@ def run_spray_job(spray_targets, label):
                                 c['status'] = 'valid-admin-uncertain'
                             else:
                                 c['status'] = 'valid'
+                        elif c.get('status') == 'untested':
+                            c['status'] = 'invalid'
                         break
             save_manifest(PROJECT_DIR, manifest)
     except Exception as e:
@@ -524,6 +577,224 @@ def run_ferox_job(host, safe, url, wordlist, extensions, threads, dont_filter=Tr
             FEROX_STATE['finished_at'] = datetime.now().isoformat()
 
 
+# ── Background BloodHound job ───────────────────────────────────────────────
+def _bloodhound_ce_signed_request(method, uri, body=None, content_type=None, timeout=30):
+    """
+    BloodHound CE's HMAC signed-request scheme, implemented to match
+    SpecterOps' own reference client (apiclient.py) exactly: a 3-link
+    HMAC-SHA256 chain over (1) the method+URI, (2) the request hour, then
+    (3) the request body. Returns (status_code, response_bytes). Raises
+    urllib.error.HTTPError / OSError on failure — caller catches these.
+    """
+    token_id = BLOODHOUND_CE['token_id']
+    token_key = BLOODHOUND_CE['token_key']
+    base = BLOODHOUND_CE['host']
+
+    digester = hmac.new(token_key.encode(), None, hashlib.sha256)
+    digester.update((method + uri).encode())
+    digester = hmac.new(digester.digest(), None, hashlib.sha256)
+
+    # Truncated to the hour, matching the reference implementation — this
+    # limits replay-ability without requiring clock-perfect sync.
+    request_datetime = datetime.now().astimezone().isoformat('T')
+    digester.update(request_datetime[:13].encode())
+    digester = hmac.new(digester.digest(), None, hashlib.sha256)
+
+    if body is not None:
+        digester.update(body)
+
+    signature = base64.b64encode(digester.digest()).decode()
+    headers = {
+        'User-Agent': 'reconscan-bloodhound-submit',
+        'Authorization': f'bhesignature {token_id}',
+        'RequestDate': request_datetime,
+        'Signature': signature,
+    }
+    if content_type:
+        headers['Content-Type'] = content_type
+
+    req = urllib.request.Request(base + uri, data=body, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read()
+
+
+def submit_to_bloodhound_ce(zip_bytes):
+    """
+    Uploads a completed collection zip to a running BloodHound CE instance:
+    start a file-upload job, upload the zip, close the job to queue
+    ingestion. Best-effort only — the local zip is always saved regardless
+    of whether this succeeds, so a failure here never loses data, just
+    means you upload it manually instead. Returns (ok, message).
+    """
+    if not BLOODHOUND_CE:
+        return False, "BloodHound CE not configured (--bh-host/--bh-key-id/--bh-key not set)"
+    try:
+        status, resp_body = _bloodhound_ce_signed_request('POST', '/api/v2/file-upload/start')
+        if status not in (200, 201):
+            return False, f"start job failed: HTTP {status}"
+        job_id = json.loads(resp_body)['data']['id']
+
+        status, _ = _bloodhound_ce_signed_request(
+            'POST', f'/api/v2/file-upload/{job_id}', body=zip_bytes, content_type='application/zip'
+        )
+        if status not in (200, 202, 204):
+            return False, f"upload failed: HTTP {status}"
+
+        status, _ = _bloodhound_ce_signed_request('POST', f'/api/v2/file-upload/{job_id}/end')
+        if status not in (200, 202, 204):
+            return False, f"closing job failed: HTTP {status}"
+
+        return True, f"submitted (job {job_id}), ingestion queued in BloodHound CE"
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode()[:300]
+        except Exception:
+            detail = ''
+        return False, f"HTTP {e.code} {e.reason} {detail}".strip()
+    except Exception as e:
+        return False, str(e)
+def run_bloodhound_job(host, safe, domain, dc_host, username, secret, cred_type):
+    out_dir = Path(f"{PROJECT_DIR}/scans/bloodhound")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final_zip = out_dir / f"{safe}.zip"
+    # Run in a dedicated, empty per-run scratch dir so we can reliably find
+    # the single zip bloodhound-python produces afterward without needing
+    # to guess its exact auto-generated filename.
+    work_dir = Path(f"{out_dir}/.{safe}_run")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with BLOODHOUND_STATE_LOCK:
+        BLOODHOUND_STATE.update(
+            running=True, host=host, log=[f"Starting BloodHound collection against {domain} via {host}"],
+            started_at=datetime.now().isoformat(), finished_at=None, error=None,
+        )
+    cmd = ['bloodhound-python', '-u', username, '-d', domain, '-ns', host,
+           '-c', 'All', '-o', str(work_dir)]
+    if dc_host:
+        cmd += ['-dc', dc_host]
+    if cred_type == 'hash':
+        cmd += ['--hashes', secret]
+    else:
+        cmd += ['-p', secret]
+    try:
+        # bloodhound-python's own source (bloodhound/__init__.py) shows its
+        # zip-compression step calls os.listdir(os.getcwd()) and writes the
+        # zip with a bare relative filename — it does NOT honor -o for that
+        # step (only some versions honor it for the raw JSON). -o alone is
+        # not enough to guarantee the zip lands in work_dir; setting cwd
+        # explicitly is what actually makes os.getcwd() resolve there.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, bufsize=1, cwd=str(work_dir))
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                with BLOODHOUND_STATE_LOCK:
+                    BLOODHOUND_STATE['log'].append(line)
+        proc.wait()
+
+        if proc.returncode not in (0, None):
+            with BLOODHOUND_STATE_LOCK:
+                BLOODHOUND_STATE['error'] = f'bloodhound-python exited with code {proc.returncode}'
+                BLOODHOUND_STATE['log'].append(f"[!] bloodhound-python exited with code {proc.returncode}")
+
+
+        json_files = list(out_dir.glob('*.json'))
+        print(json_files)
+
+        if json_files:
+            if final_zip.exists():
+                final_zip.unlink()
+
+            with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for json_file in json_files:
+                    zf.write(json_file, arcname=json_file.name)
+
+            with BLOODHOUND_STATE_LOCK:
+                BLOODHOUND_STATE['log'].append(f"Collection complete — saved to {final_zip.name}")
+
+            # Best-effort summary counts straight out of the zip's JSON files —
+            # purely informational, never blocks saving the actual result.
+            summary = {}
+
+            try:
+                with zipfile.ZipFile(final_zip) as zf:
+                    for name in zf.namelist():
+                        m = re.match(r'.*_(\w+)\.json$', name)
+                        print(m)
+
+                        if not m:
+                            continue
+
+                        kind = m.group(1)
+
+                        try:
+                            data = json.loads(zf.read(name))
+                            count = len(data.get('data', []))
+                            summary[kind] = count
+
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+
+            except Exception as e:
+                print(e)
+
+            try:
+                for json_file in json_files:
+                    if json_file.exists():
+                        json_file.unlink()
+
+                with BLOODHOUND_STATE_LOCK:
+                    BLOODHOUND_STATE['log'].append(
+                        f"Cleaned up {len(json_files)} BloodHound JSON files"
+                    )
+
+            except Exception as e:
+                print(f"JSON cleanup failed: {e}")
+
+            with MANIFEST_LOCK:
+                manifest = load_manifest(PROJECT_DIR)
+                if host in manifest:
+                    manifest[host]['bloodhound_domain'] = domain
+                    manifest[host]['bloodhound_scanned_at'] = datetime.now().isoformat()
+                    manifest[host]['bloodhound_summary'] = summary
+                    save_manifest(PROJECT_DIR, manifest)
+
+            # Auto-submit to BloodHound CE if --bh-host/--bh-key-id/--bh-key were
+            # given at startup. Never required — the zip is already safely saved
+            # locally above regardless of whether this succeeds.
+            if BLOODHOUND_CE:
+                with BLOODHOUND_STATE_LOCK:
+                    BLOODHOUND_STATE['log'].append(f"Submitting to BloodHound CE at {BLOODHOUND_CE['host']}\u2026")
+                print(final_zip)
+                submit_ok, submit_msg = submit_to_bloodhound_ce(final_zip.read_bytes())
+                with BLOODHOUND_STATE_LOCK:
+                    BLOODHOUND_STATE['log'].append(
+                        (f"[+] BloodHound CE: {submit_msg}" if submit_ok else f"[!] BloodHound CE submit failed: {submit_msg}")
+                    )
+        else:
+            with BLOODHOUND_STATE_LOCK:
+                BLOODHOUND_STATE['error'] = 'bloodhound-python finished but produced no zip file'
+                BLOODHOUND_STATE['log'].append('[!] No zip output found \u2014 check the log above for errors')
+    except FileNotFoundError:
+        with BLOODHOUND_STATE_LOCK:
+            BLOODHOUND_STATE['error'] = 'bloodhound-python not found on this server'
+            BLOODHOUND_STATE['log'].append('[-] bloodhound-python not found on this server')
+    except Exception as e:
+        with BLOODHOUND_STATE_LOCK:
+            BLOODHOUND_STATE['error'] = str(e)
+            BLOODHOUND_STATE['log'].append(f"[-] BloodHound job failed: {e}")
+    finally:
+        try:
+            for f in work_dir.glob('*'):
+                f.unlink()
+            work_dir.rmdir()
+        except OSError:
+            pass
+        chown_project_dir(PROJECT_DIR)
+        with BLOODHOUND_STATE_LOCK:
+            BLOODHOUND_STATE['running'] = False
+            BLOODHOUND_STATE['finished_at'] = datetime.now().isoformat()
+
+
 def compute_pwns_by_target(manifest: dict) -> dict:
     """
     Reverse-index of spray results: {target_host: [hit, ...]}.
@@ -588,7 +859,7 @@ def render_dashboard():
         if r.get('services'):
             meta_bits.append(h(', '.join(r['services'][:6])))
 
-        owned_class = ' fully-owned' if (local and proof) else ''
+        owned_class = ' fully-owned' if proof else ''
         cards += f"""
 <div class='target-card{owned_class}' data-host='{h(ip)}'>
   <a href='/scans/html/{h(safe)}.html' style='text-decoration:none'>
@@ -1212,7 +1483,7 @@ def api_start_scan():
             return jsonify(ok=False, description="A scan is already in progress"), 409
 
     threading.Thread(
-        target=run_scan_job, args=(targets, threads, ports, not no_udp), daemon=True
+        target=run_scan_job, args=(targets, threads, ports, not no_udp, PROXY_PORT), daemon=True
     ).start()
     return jsonify(ok=True, targets=targets)
 
@@ -1346,6 +1617,91 @@ def api_ferox(host):
 def api_ferox_status():
     with FEROX_STATE_LOCK:
         return jsonify(dict(FEROX_STATE))
+
+
+@app.route('/api/bloodhound/<host>', methods=['GET', 'POST'])
+def api_bloodhound(host):
+    with MANIFEST_LOCK:
+        manifest = load_manifest(PROJECT_DIR)
+        if host not in manifest:
+            return jsonify(ok=False, description=f"host {host} not found in project"), 404
+        record = manifest[host]
+        safe = record.get('safe') or host.replace('/', '_').replace('.', '-')
+
+        if request.method == 'GET':
+            candidates = find_ldap_credentials(manifest, host)
+            note_path = PROJECT_DIR / 'notes' / f"{host}.md"
+            note_text = note_path.read_text(encoding='utf-8', errors='ignore') if note_path.exists() else ''
+            suggested_domain = parse_domain_from_note(note_text)
+
+            last_run = None
+            if record.get('bloodhound_scanned_at'):
+                zip_path = PROJECT_DIR / 'scans' / 'bloodhound' / f"{safe}.zip"
+                if zip_path.exists():
+                    last_run = {
+                        'scanned_at': record.get('bloodhound_scanned_at'),
+                        'domain': record.get('bloodhound_domain'),
+                        'summary': record.get('bloodhound_summary', {}),
+                        'zip_url': f"/scans/bloodhound/{safe}.zip",
+                    }
+
+            return jsonify(
+                ok=True,
+                credentials=[{k: c[k] for k in ('source_host', 'cred_id', 'username', 'status')} for c in candidates],
+                suggested_domain=suggested_domain,
+                last_run=last_run,
+            )
+
+    # POST — start a new collection
+    data = request.get_json(silent=True) or {}
+    source_host = data.get('source_host', '')
+    cred_id = data.get('cred_id', '')
+    domain = (data.get('domain') or '').strip()
+    dc_host = (data.get('dc') or '').strip()
+
+    if not domain:
+        return jsonify(ok=False, description="domain is required"), 400
+    if not source_host or not cred_id:
+        return jsonify(ok=False, description="no credential selected"), 400
+
+    with MANIFEST_LOCK:
+        manifest = load_manifest(PROJECT_DIR)
+        source_record = manifest.get(source_host)
+        if not source_record:
+            return jsonify(ok=False, description=f"credential's source host {source_host} not found"), 404
+        cred = next((c for c in source_record.get('credentials', []) if c.get('id') == cred_id), None)
+        if not cred:
+            return jsonify(ok=False, description="credential not found — it may have been deleted"), 404
+
+    if not shutil.which('bloodhound-python'):
+        return jsonify(ok=False, description="bloodhound-python not found on this server"), 500
+
+    with BLOODHOUND_STATE_LOCK:
+        if BLOODHOUND_STATE['running']:
+            return jsonify(ok=False, description="A BloodHound collection is already in progress"), 409
+
+    manifest = load_manifest(PROJECT_DIR)
+    safe = manifest[host].get('safe') or host.replace('/', '_').replace('.', '-')
+    threading.Thread(
+        target=run_bloodhound_job,
+        args=(host, safe, domain, dc_host, cred.get('username', ''), cred.get('secret', ''), cred.get('type', 'password')),
+        daemon=True,
+    ).start()
+    return jsonify(ok=True, host=host, domain=domain)
+
+
+@app.route('/api/bloodhound/status')
+def api_bloodhound_status():
+    with BLOODHOUND_STATE_LOCK:
+        return jsonify(dict(BLOODHOUND_STATE))
+
+
+@app.route('/scans/bloodhound/<path:filename>')
+def serve_bloodhound(filename):
+    d = PROJECT_DIR / 'scans' / 'bloodhound'
+    if not (d / filename).exists():
+        abort(404)
+    return send_from_directory(d, filename, mimetype='application/zip', as_attachment=True)
 
 
 @app.route('/api/pwns/<host>')
@@ -1483,6 +1839,7 @@ def api_remap():
             applied = True
             manifest = load_manifest(PROJECT_DIR)
             write_creds_files(PROJECT_DIR, manifest)
+            write_targets_file(PROJECT_DIR, manifest)
 
     if applied:
         chown_project_dir(PROJECT_DIR)
@@ -1516,6 +1873,7 @@ def api_delete_host(host):
         f"scans/searchsploit/{safe}.txt",
         f"scans/creds/{safe}.txt",
         f"scans/ferox/{safe}.jsonl",
+        f"scans/bloodhound/{safe}.zip",
         f"notes/{host}.md",
     ]:
         fpath = PROJECT_DIR / rel
@@ -1530,34 +1888,67 @@ def api_delete_host(host):
     rs.render_index(all_results, PROJECT_DIR, datetime.now())
     rs.render_obsidian_summary(all_results, PROJECT_DIR, datetime.now())
 
-    # Drop the deleted host's creds out of the aggregated creds.txt too.
+    # Drop the deleted host's creds out of the aggregated creds.txt too,
+    # and the host itself out of targets.txt.
     write_creds_files(PROJECT_DIR, manifest)
+    write_targets_file(PROJECT_DIR, manifest)
     chown_project_dir(PROJECT_DIR)
 
     return jsonify(ok=True, deleted=host)
 
 
 def main():
-    global PROJECT_DIR
+    global PROJECT_DIR, BLOODHOUND_CE, PROXY_PORT
     p = argparse.ArgumentParser(description='Live dashboard + scan launcher for a recon_scan.py project')
     p.add_argument('project', help='Project directory (created automatically if it does not exist)')
     p.add_argument('--host', default='127.0.0.1', help='Bind address (use 0.0.0.0 to reach it from other devices)')
     p.add_argument('--port', type=int, default=5000)
     p.add_argument('--debug', action='store_true', default=False)
+    p.add_argument('--proxy-port', type=int, default=9050,
+                    help='SOCKS port to use via proxychains for targets with no direct route in the '
+                         'kernel routing table (e.g. reachable only through an SSH -D / chisel-style '
+                         'SOCKS tunnel, not a route-based one like ligolo-ng). Default: 9050. Every '
+                         'scan checks routability per-target automatically.')
+    p.add_argument('--bh-host', default=None,
+                    help='BloodHound CE base URL (e.g. http://localhost:8080) — if set along with '
+                         '--bh-key-id and --bh-key, BloodHound scan results are automatically '
+                         'submitted for ingestion after each collection completes. Optional; '
+                         'nothing changes if omitted.')
+    p.add_argument('--bh-key-id', default=None,
+                    help='BloodHound CE API Token ID (the public half of the pair — generate both '
+                         'under Administration -> API Tokens in the BloodHound CE UI). Requires '
+                         '--bh-host and --bh-key too.')
+    p.add_argument('--bh-key', default=None,
+                    help='BloodHound CE API Token Key (the secret half of the pair). Requires '
+                         '--bh-host and --bh-key-id too.')
     args = p.parse_args()
 
     PROJECT_DIR = ensure_project_dirs(args.project)
+    PROXY_PORT = args.proxy_port
 
     if not shutil.which('nmap'):
         warn("nmap not found — scans started from the dashboard will fail until it's installed")
     if not shutil.which('searchsploit'):
         warn("searchsploit not found — exploit lookups will be skipped for scans run from here")
-    if hasattr(os, 'geteuid') and os.geteuid() != 0:
-        warn("Not running as root — nmap's SYN/UDP scans need raw sockets. "
-             "Run with sudo, or scans from the dashboard may fail or degrade.")
+    if not shutil.which('proxychains'):
+        warn("proxychains not found — targets with no direct route will fail to scan until it's installed "
+             "(only matters if you're pivoting through a SOCKS proxy)")
+    if nmap_needs_sudo():
+        warn("Not running as root and nmap doesn't have the raw-socket capability set — "
+             "SYN/UDP scans need one or the other. Either run this with sudo, or (recommended) "
+             "run ./setup_caps.sh once so nmap can do it unprivileged and you never need sudo again.")
+
+    bh_flags_given = [args.bh_host, args.bh_key_id, args.bh_key]
+    if all(bh_flags_given):
+        BLOODHOUND_CE = {'host': args.bh_host.rstrip('/'), 'token_id': args.bh_key_id, 'token_key': args.bh_key}
+        ok(f"BloodHound CE auto-submit enabled -> {B}{BLOODHOUND_CE['host']}{X}")
+    elif any(bh_flags_given):
+        warn("--bh-host, --bh-key-id, and --bh-key must all be set together for BloodHound CE "
+             "auto-submit — only some were given, so it's disabled for this run.")
 
     n_hosts = len(load_manifest(PROJECT_DIR))
     write_creds_files(PROJECT_DIR, load_manifest(PROJECT_DIR))
+    write_targets_file(PROJECT_DIR, load_manifest(PROJECT_DIR))
     chown_project_dir(PROJECT_DIR)
     ok(f"Serving {B}{PROJECT_DIR}{X} ({n_hosts} host(s)) at {C}http://{args.host}:{args.port}/{X}")
     if args.host == '0.0.0.0':

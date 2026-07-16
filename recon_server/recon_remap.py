@@ -42,6 +42,7 @@ ASSOCIATED_FILES = [
     ('scans/searchsploit/{safe}.txt', False),
     ('scans/creds/{safe}.txt', False),
     ('scans/ferox/{safe}.jsonl', False),
+    ('scans/bloodhound/{safe}.zip', False),
     ('notes/{host}.md', True),
 ]
 
