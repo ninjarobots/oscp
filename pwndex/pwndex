@@ -346,12 +346,66 @@ def fetch_readme(result: Result) -> str:
         return f"[File not found: {result.path}]"
 
 
+def fetch_edb_exploit(result: Result, clone_dir="/tmp") -> tuple[bool, str]:
+    """Download an ExploitDB exploit file to /tmp."""
+    if not result.edb_id:
+        return False, "No EDB-ID on this result"
+
+    # Try local file first (searchsploit path)
+    if result.path and os.path.exists(result.path):
+        ext  = os.path.splitext(result.path)[1] or ".txt"
+        safe = re.sub(r'[^\w\-.]', '_', result.title)[:60]
+        dest = os.path.join(clone_dir, f"edb-{result.edb_id}-{safe}{ext}")
+        try:
+            import shutil
+            shutil.copy2(result.path, dest)
+            result.cloned    = True
+            result.clone_path = dest
+            return True, f"Copied to {dest}"
+        except Exception as e:
+            pass  # fall through to download
+
+    # Download from exploit-db
+    url  = f"https://www.exploit-db.com/download/{result.edb_id}"
+    safe = re.sub(r'[^\w\-.]', '_', result.title)[:60]
+    dest = os.path.join(clone_dir, f"edb-{result.edb_id}-{safe}.txt")
+
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/plain,*/*",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            # Detect extension from Content-Type
+            ct   = resp.headers.get("Content-Type", "")
+            cdisp = resp.headers.get("Content-Disposition", "")
+            # Try to get filename from Content-Disposition
+            fname_match = re.search(r'filename="?([^";]+)"?', cdisp)
+            if fname_match:
+                ext  = os.path.splitext(fname_match.group(1))[1] or ".txt"
+                dest = os.path.join(clone_dir, f"edb-{result.edb_id}{ext}")
+            elif "python" in ct or "x-python" in ct:
+                dest = dest.replace(".txt", ".py")
+            elif "ruby" in ct:
+                dest = dest.replace(".txt", ".rb")
+            elif "html" in ct:
+                dest = dest.replace(".txt", ".html")
+
+            with open(dest, "wb") as f:
+                f.write(resp.read())
+
+        result.cloned     = True
+        result.clone_path = dest
+        return True, f"Downloaded to {dest}"
+    except Exception as e:
+        return False, f"Download failed: {e}"
+
+
 def clone_repo(result: Result, clone_dir="/tmp") -> tuple[bool, str]:
-    if result.kind != "github":
-        return False, "Not a GitHub result"
+    """Clone a GitHub repo to clone_dir."""
     dest = os.path.join(clone_dir, result.title.split("/")[-1])
     if os.path.exists(dest):
-        result.cloned = True
+        result.cloned     = True
         result.clone_path = dest
         return True, f"Already exists: {dest}"
     try:
@@ -360,7 +414,7 @@ def clone_repo(result: Result, clone_dir="/tmp") -> tuple[bool, str]:
             capture_output=True, text=True, timeout=60
         )
         if r.returncode == 0:
-            result.cloned = True
+            result.cloned     = True
             result.clone_path = dest
             return True, f"Cloned to {dest}"
         return False, r.stderr.strip()
@@ -531,9 +585,9 @@ class TUI:
 
         # Key hints at bottom
         if self.mode == "list":
-            hints = " ↑↓ navigate  ENTER view  c clone  q quit "
+            hints = " ↑↓ navigate  ENTER view  c clone/fetch  q quit "
         else:
-            hints = " ↑↓ scroll  c clone  r readme  b back  q quit "
+            hints = " ↑↓ scroll  c clone/fetch  r readme  b back  q quit "
         self.safe_addstr(self.scr, h - 1, 0, hints.ljust(w),
                          curses.color_pair(CP_HEADER))
 
@@ -781,12 +835,14 @@ class TUI:
         if self.idx >= len(self.results):
             return
         r = self.results[self.idx]
-        if r.kind != "github":
-            self.status = "Can only clone GitHub repos"
-            return
-        self.status = f"Cloning {r.title}..."
-        self.draw()
-        ok, msg = clone_repo(r)
+        if r.kind == "github":
+            self.status = f"Cloning {r.title}..."
+            self.draw()
+            ok, msg = clone_repo(r)
+        else:
+            self.status = f"Fetching EDB-{r.edb_id}..."
+            self.draw()
+            ok, msg = fetch_edb_exploit(r)
         self.status = msg
 
     # ── Main loop ─────────────────────────────────────────────────
